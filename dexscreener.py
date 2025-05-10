@@ -24,7 +24,10 @@ class DexScreenerAPI:
             async with self.session.get(f"{self.base_url}/dex/tokens/{token_address}") as response:
                 if response.status == 200:
                     data = await response.json()
-                    return data.get('pairs', [])[0] if data.get('pairs') else None
+                    if data.get('pairs'):
+                        # Сортируем пары по ликвидности (по убыванию)
+                        pairs = sorted(data['pairs'], key=lambda x: float(x.get('liquidity', {}).get('usd', 0)), reverse=True)
+                        return pairs[0] if pairs else None
                 return None
         except Exception as e:
             logger.error(f"Error getting token info: {e}")
@@ -44,40 +47,77 @@ class DexScreenerAPI:
             time_window: Временное окно в секундах для поиска транзакций
         """
         try:
-            # Получаем информацию о токене
-            token_info = await self.get_token_info(token_address)
-            if not token_info:
-                return []
-
-            # Получаем транзакции
-            async with self.session.get(
-                f"{self.base_url}/dex/pairs/{token_info['chainId']}/{token_info['pairAddress']}/transactions"
-            ) as response:
+            # Получаем информацию о токене и его парах
+            async with self.session.get(f"{self.base_url}/dex/tokens/{token_address}") as response:
                 if response.status != 200:
                     return []
-
+                
                 data = await response.json()
-                transactions = data.get('transactions', [])
+                pairs = data.get('pairs', [])
+                
+                if not pairs:
+                    return []
 
-                # Фильтруем транзакции
-                filtered_transactions = []
-                for tx in transactions:
-                    # Проверяем временное окно
-                    tx_time = datetime.fromtimestamp(tx['timestamp'])
-                    if datetime.now() - tx_time > timedelta(seconds=time_window):
-                        continue
+                # Сортируем пары по ликвидности
+                pairs = sorted(pairs, key=lambda x: float(x.get('liquidity', {}).get('usd', 0)), reverse=True)
+                
+                # Берем самую ликвидную пару
+                pair = pairs[0]
+                chain_id = pair['chainId']
+                pair_address = pair['pairAddress']
 
-                    # Проверяем тип транзакции
-                    if transaction_type and tx['type'].lower() != transaction_type.lower():
-                        continue
+                # Получаем транзакции для пары
+                async with self.session.get(f"{self.base_url}/dex/pairs/{chain_id}/{pair_address}") as response:
+                    if response.status != 200:
+                        return []
 
-                    # Проверяем сумму
-                    if float(tx['amountUsd']) < min_amount:
-                        continue
+                    pair_data = await response.json()
+                    if not pair_data.get('pairs'):
+                        return []
 
-                    filtered_transactions.append(tx)
+                    pair_info = pair_data['pairs'][0]
+                    transactions = []
 
-                return filtered_transactions
+                    # Получаем статистику транзакций
+                    txns = pair_info.get('txns', {})
+                    volume = pair_info.get('volume', {})
+                    
+                    # Формируем транзакции на основе статистики
+                    for time_frame, txn_data in txns.items():
+                        if 'buys' in txn_data:
+                            for _ in range(txn_data['buys']):
+                                transactions.append({
+                                    'type': 'buy',
+                                    'amountUsd': volume.get(time_frame, 0) / (txn_data['buys'] + txn_data.get('sells', 0)),
+                                    'timestamp': int(datetime.now().timestamp())
+                                })
+                        if 'sells' in txn_data:
+                            for _ in range(txn_data['sells']):
+                                transactions.append({
+                                    'type': 'sell',
+                                    'amountUsd': volume.get(time_frame, 0) / (txn_data['buys'] + txn_data.get('sells', 0)),
+                                    'timestamp': int(datetime.now().timestamp())
+                                })
+
+                    # Фильтруем транзакции
+                    filtered_transactions = []
+                    for tx in transactions:
+                        # Проверяем временное окно
+                        tx_time = datetime.fromtimestamp(tx['timestamp'])
+                        if datetime.now() - tx_time > timedelta(seconds=time_window):
+                            continue
+
+                        # Проверяем тип транзакции
+                        if transaction_type and tx['type'].lower() != transaction_type.lower():
+                            continue
+
+                        # Проверяем сумму
+                        if float(tx['amountUsd']) < min_amount:
+                            continue
+
+                        filtered_transactions.append(tx)
+
+                    return filtered_transactions
 
         except Exception as e:
             logger.error(f"Error getting transactions: {e}")

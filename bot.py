@@ -37,6 +37,7 @@ class DexScreenerBot:
             "/unwatch <адрес_токена> - Прекратить отслеживание\n"
             "/list - Показать список отслеживаемых токенов\n"
             "/settings - Настройки мониторинга\n"
+            "/last_tx <адрес_токена> - Показать последние транзакции токена\n"
             "/help - Показать это сообщение"
         )
 
@@ -181,6 +182,74 @@ class DexScreenerBot:
         """Обработчик команды /help"""
         await self.start(update, context)
 
+    async def last_tx(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик команды /last_tx"""
+        if not context.args:
+            await update.message.reply_text("Пожалуйста, укажите адрес токена для получения последних транзакций")
+            return
+
+        token_address = context.args[0]
+        async with DexScreenerAPI() as api:
+            try:
+                # Получаем информацию о токене и его парах
+                async with api.session.get(f"{api.base_url}/dex/tokens/{token_address}") as response:
+                    if response.status != 200:
+                        await update.message.reply_text("Ошибка при получении информации о токене.")
+                        return
+                    
+                    data = await response.json()
+                    pairs = data.get('pairs', [])
+                    
+                    if not pairs:
+                        await update.message.reply_text("Пары для этого токена не найдены.")
+                        return
+
+                    # Сортируем пары по ликвидности
+                    pairs = sorted(pairs, key=lambda x: float(x.get('liquidity', {}).get('usd', 0)), reverse=True)
+                    
+                    # Берем самую ликвидную пару
+                    pair = pairs[0]
+                    chain_id = pair['chainId']
+                    pair_address = pair['pairAddress']
+                    pair_url = pair.get('url', '')
+                    base_token = pair.get('baseToken', {})
+                    quote_token = pair.get('quoteToken', {})
+
+                    # Получаем детальную информацию о паре
+                    async with api.session.get(f"{api.base_url}/dex/pairs/{chain_id}/{pair_address}") as response:
+                        if response.status != 200:
+                            await update.message.reply_text("Не удалось получить информацию о паре.")
+                            return
+
+                        pair_data = await response.json()
+                        if not pair_data.get('pairs'):
+                            await update.message.reply_text("Информация о паре не найдена.")
+                            return
+
+                        pair_info = pair_data['pairs'][0]
+                        
+                        # Формируем сообщение с информацией о паре
+                        message = (
+                            f"💱 Пара: {base_token.get('symbol', '')}/{quote_token.get('symbol', '')}\n"
+                            f"🔗 Ссылка: {pair_url}\n"
+                            f"💰 Цена: ${float(pair_info.get('priceUsd', 0)):.6f}\n"
+                            f"💧 Ликвидность: ${float(pair_info.get('liquidity', {}).get('usd', 0)):,.2f}\n\n"
+                            f"📊 Статистика транзакций:\n"
+                        )
+
+                        # Добавляем статистику по временным интервалам
+                        txns = pair_info.get('txns', {})
+                        for time_frame, txn_data in txns.items():
+                            buys = txn_data.get('buys', 0)
+                            sells = txn_data.get('sells', 0)
+                            message += f"{time_frame}: 🟢 {buys} покупок, 🔴 {sells} продаж\n"
+
+                        await update.message.reply_text(message)
+
+            except Exception as e:
+                logger.error(f"Error in last_tx: {e}")
+                await update.message.reply_text(f"Произошла ошибка при получении информации: {str(e)}")
+
 def main():
     """Запуск бота"""
     bot = DexScreenerBot()
@@ -193,6 +262,7 @@ def main():
     application.add_handler(CommandHandler("list", bot.list_watched))
     application.add_handler(CommandHandler("settings", bot.settings))
     application.add_handler(CommandHandler("help", bot.help_command))
+    application.add_handler(CommandHandler("last_tx", bot.last_tx))
 
     # Добавляем задачу проверки транзакций
     application.job_queue.run_repeating(bot.check_transactions, interval=CHECK_INTERVAL)
